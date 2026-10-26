@@ -1,5 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import * as readline from 'node:readline'
+import { StringDecoder } from 'node:string_decoder'
+import type { McpServer } from '@agentclientprotocol/sdk'
+import { fileURLToPath } from 'node:url'
+import { readNativeIdentity, verifyNativeIdentity, type NativeIdentity } from '../acp/identity.js'
+import { existsSync } from 'node:fs'
 import crossSpawn from 'cross-spawn'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
@@ -30,7 +34,8 @@ function stripAnsi(s: string): string {
 
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
-  | { type: 'abort'; id?: string }
+  | { type: 'abort' | 'clear_queue' | 'clone'; id?: string }
+  | { type: 'steer' | 'follow_up'; id?: string; message: string; images?: unknown[] }
   | { type: 'get_state'; id?: string }
   // Model
   | { type: 'get_available_models'; id?: string }
@@ -103,9 +108,13 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  mcpServers?: McpServer[]
+  createSession?: boolean
+  expectedNativeSessionId?: string
 }
 
 export class PiRpcProcess {
+  nativeIdentity?: NativeIdentity
   private readonly child: ChildProcessWithoutNullStreams
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
@@ -114,8 +123,9 @@ export class PiRpcProcess {
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
 
-    const rl = readline.createInterface({ input: child.stdout })
-    rl.on('line', line => {
+    const decoder = new StringDecoder('utf8')
+    let buffered = ''
+    const consume = (line: string) => {
       if (!line.trim()) return
       let msg: any
       try {
@@ -137,12 +147,22 @@ export class PiRpcProcess {
       }
 
       for (const h of this.eventHandlers) h(msg as PiRpcEvent)
+    }
+    child.stdout.on('data', (chunk: Buffer) => {
+      buffered += decoder.write(chunk)
+      let boundary: number
+      while ((boundary = buffered.indexOf('\n')) >= 0) {
+        const line = buffered.slice(0, boundary)
+        buffered = buffered.slice(boundary + 1)
+        consume(line.replace(/\r$/, ''))
+      }
     })
 
     child.on('exit', (code, signal) => {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      for (const handler of this.eventHandlers) handler({ type: 'process_exit', error: err.message })
     })
 
     child.on('error', err => {
@@ -152,6 +172,10 @@ export class PiRpcProcess {
   }
 
   static async spawn(params: SpawnParams): Promise<PiRpcProcess> {
+    const expected = params.sessionPath && !params.createSession ? readNativeIdentity(params.sessionPath) : undefined
+    if (expected && params.expectedNativeSessionId && expected.sessionId !== params.expectedNativeSessionId) {
+      throw new Error('PI_IDENTITY_MISMATCH: persisted mapping conflicts with native file')
+    }
     // On Windows, npm commonly creates pi.cmd / pi.bat launcher scripts.
     const cmd = getPiCommand(params.piCommand)
 
@@ -160,6 +184,31 @@ export class PiRpcProcess {
     // Keep extensions + prompt templates enabled because ACP users may rely on them
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
+    const env = { ...process.env }
+    {
+      const servers: Record<string, unknown> = {}
+      for (const server of params.mcpServers ?? []) {
+        if ('type' in server && server.type === 'sse') throw new Error('PI_MCP_TRANSPORT_UNSUPPORTED: SSE')
+        if ('command' in server) {
+          servers[server.name] = {
+            command: server.command,
+            args: server.args,
+            env: Object.fromEntries(server.env.map(v => [v.name, v.value])),
+            exposure: 'direct'
+          }
+        } else if ('url' in server) {
+          servers[server.name] = {
+            url: server.url,
+            headers: Object.fromEntries(server.headers.map(v => [v.name, v.value])),
+            exposure: 'direct'
+          }
+        }
+      }
+      env.PI_ACP_MCP_SERVERS_JSON = JSON.stringify(servers)
+      const built = fileURLToPath(new URL('./pi-mcp-extension.js', import.meta.url))
+      const extension = existsSync(built) ? built : fileURLToPath(new URL('../pi-mcp-extension.ts', import.meta.url))
+      args.push('--extension', extension)
+    }
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
     // Windows cmd launchers need shell escaping; direct executables use native argv.
@@ -167,7 +216,7 @@ export class PiRpcProcess {
     const child = start(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env
+      env
     }) as ChildProcessWithoutNullStreams
 
     // Ensure spawn failures (e.g. ENOENT when pi isn't installed) are surfaced as a
@@ -206,26 +255,23 @@ export class PiRpcProcess {
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
 
-    child.stderr.on('data', () => {
-      // leave stderr untouched; ACP clients may capture it.
+    child.stderr.on('data', (chunk: Buffer) => {
+      process.stderr.write(chunk)
     })
 
     const proc = new PiRpcProcess(child)
 
-    // Best-effort handshake.
-    // Important: pi may emit a get_state response pointing at a sessionFile in a directory
-    // that is created lazily. Create the parent dir up-front to avoid later parse errors
-    // when we call commands like export_html.
     try {
-      const state = (await proc.getState()) as any
-      const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-      if (sessionFile) {
-        const { mkdirSync } = await import('node:fs')
-        const { dirname } = await import('node:path')
-        mkdirSync(dirname(sessionFile), { recursive: true })
+      proc.nativeIdentity = verifyNativeIdentity(await proc.getState(), params.cwd, expected)
+      const commands = (await proc.getCommands()) as { commands?: Array<{ name?: string }> }
+      if (!commands.commands?.some(command => command.name === 'codeg-pi-runtime-v1')) {
+        throw new Error(
+          'PI_RUNTIME_UPGRADE_REQUIRED: matching native MCP extension did not load; Pi 1.4.0 or newer is required'
+        )
       }
-    } catch {
-      // ignore for now
+    } catch (error) {
+      proc.dispose()
+      throw error
     }
 
     return proc
@@ -256,9 +302,29 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
+  async prompt(message: string, images: unknown[] = []): Promise<string | undefined> {
     const res = await this.request({ type: 'prompt', message, images })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return (res.data as { disposition?: string } | undefined)?.disposition
+  }
+
+  async clearQueue(): Promise<void> {
+    const res = await this.request({ type: 'clear_queue' })
+    if (!res.success) throw new Error(`pi clear_queue failed: ${res.error}`)
+  }
+
+  async steer(message: string, images: unknown[] = [], followUp = false): Promise<string> {
+    const res = await this.request({ type: followUp ? 'follow_up' : 'steer', message, images })
+    if (!res.success) throw new Error(`pi steering failed: ${res.error}`)
+    const disposition = (res.data as { disposition?: string } | undefined)?.disposition
+    if (disposition !== 'queued' && disposition !== 'handled') throw new Error('PI_STEER_UNCONFIRMED')
+    return disposition
+  }
+
+  async clone(): Promise<void> {
+    const res = await this.request({ type: 'clone' })
+    if (!res.success || (res.data as { cancelled?: boolean } | undefined)?.cancelled)
+      throw new Error('PI_FORK_CANCELLED')
   }
 
   async abort(): Promise<void> {
@@ -368,7 +434,7 @@ export class PiRpcProcess {
   private request(cmd: PiRpcCommand, opts?: { timeoutMs?: number }): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
-    const timeoutMs = opts?.timeoutMs
+    const timeoutMs = opts?.timeoutMs ?? 30_000
 
     const line = `${JSON.stringify(withId)}\n`
 

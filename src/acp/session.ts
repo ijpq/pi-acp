@@ -9,7 +9,10 @@ import type {
   ToolKind
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, closeSync, openSync } from 'node:fs'
+import { join } from 'node:path'
+import { getPiSessionsDir } from './pi-sessions.js'
+import { verifyNativeIdentity } from './identity.js'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import {
   PiRpcProcess,
@@ -210,11 +213,20 @@ export class SessionManager {
   async create(params: SessionCreateParams): Promise<PiAcpSession> {
     // Let pi manage session persistence in its default location (~/.pi/agent/sessions/...)
     // so sessions are visible to the regular `pi` CLI.
+    const dir = getPiSessionsDir()
+    mkdirSync(dir, { recursive: true })
+    // Pi initializes an explicitly allocated empty file with its own native header.
+    // This also makes an unused session recoverable without inventing a JSONL header.
+    const sessionPath = join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}_${crypto.randomUUID()}_acp.jsonl`)
+    closeSync(openSync(sessionPath, 'wx', 0o600))
     let proc: PiRpcProcess
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        sessionPath,
+        createSession: true,
+        mcpServers: params.mcpServers
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -223,19 +235,15 @@ export class SessionManager {
       throw e
     }
 
-    let state: any = null
+    let identity
     try {
-      state = (await proc.getState()) as any
-    } catch {
-      state = null
+      identity = verifyNativeIdentity(await proc.getState(), params.cwd)
+    } catch (error) {
+      proc.dispose()
+      throw error
     }
-
-    const sessionId = typeof state?.sessionId === 'string' ? state.sessionId : crypto.randomUUID()
-    const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-
-    if (sessionFile) {
-      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
-    }
+    const { sessionId, sessionFile } = identity
+    this.store.upsert({ sessionId, cwd: params.cwd, sessionFile, nativeSessionId: sessionId })
 
     const session = new PiAcpSession({
       sessionId,
@@ -298,6 +306,12 @@ export class PiAcpSession {
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
   private cancelRequested = false
+  private turnFailed = false
+  private settling = false
+
+  isRunning(): boolean {
+    return this.pendingTurn !== null
+  }
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
@@ -421,6 +435,7 @@ export class PiAcpSession {
     }
 
     // Abort the currently running turn (if any). If nothing is running, this is a no-op.
+    await this.proc.clearQueue()
     await this.proc.abort()
   }
 
@@ -513,13 +528,17 @@ export class PiAcpSession {
   }
 
   private async settleTurn(): Promise<void> {
+    if (!this.pendingTurn || this.settling) return
+    this.settling = true
+    const turn = this.pendingTurn
     // Ensure all updates derived from pi events (plus the final usage update) are
     // delivered before we resolve the ACP `session/prompt` request.
     await this.publishContextUsage()
 
-    const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-    this.pendingTurn?.resolve(reason)
+    const reason: StopReason = this.cancelRequested ? 'cancelled' : this.turnFailed ? 'error' : 'end_turn'
+    turn.resolve(reason)
     this.pendingTurn = null
+    this.settling = false
     this.inAgentLoop = false
 
     // Start next queued prompt, if any.
@@ -594,6 +613,7 @@ export class PiAcpSession {
 
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
+    this.turnFailed = false
     this.inAgentLoop = false
 
     this.pendingTurn = { title: t.title, resolve: t.resolve, reject: t.reject }
@@ -608,37 +628,52 @@ export class PiAcpSession {
     // Kick off pi, but completion is determined by pi events, not the RPC response.
     // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
     // continuations may emit multiple `agent_end` events before `agent_settled`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-        const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
-
-        this.pendingTurn = null
-        this.inAgentLoop = false
-
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
-        })
+    const turn = this.pendingTurn
+    this.proc
+      .prompt(t.message, t.images)
+      .then(disposition => {
+        if (disposition === 'handled') return this.settleTurn()
       })
-      void err
-    })
+      .catch(err => {
+        // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
+        // Also ensure we flush any already-enqueued updates first.
+        void this.flushEmits().finally(() => {
+          if (this.pendingTurn !== turn) return
+          // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
+          const authErr = maybeAuthRequiredError(err)
+          if (authErr) {
+            this.pendingTurn?.reject(authErr)
+          } else {
+            const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
+            this.pendingTurn?.resolve(reason)
+          }
+
+          this.pendingTurn = null
+          for (const queued of this.turnQueue.splice(0)) queued.reject(err)
+          this.inAgentLoop = false
+
+          // If the prompt failed, do not automatically proceed—pi may be unhealthy.
+          // But we still clear the queueDepth metadata.
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          })
+        })
+        void err
+      })
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
 
     switch (type) {
+      case 'process_exit': {
+        const error = new Error(String(ev.error ?? 'Pi process exited'))
+        this.pendingTurn?.reject(error)
+        this.pendingTurn = null
+        for (const queued of this.turnQueue.splice(0)) queued.reject(error)
+        break
+      }
       case 'session_info_changed': {
         const name = (ev as { name?: unknown }).name
         if (typeof name === 'string' || name === undefined) this.publishTitle(name ?? null)
@@ -943,6 +978,12 @@ export class PiAcpSession {
             text: 'Automatic compaction finished; context was summarized to continue the session.'
           } satisfies ContentBlock
         })
+        break
+      }
+
+      case 'message_end': {
+        const message = ev.message as { role?: string; stopReason?: string } | undefined
+        if (message?.role === 'assistant' && message.stopReason === 'error') this.turnFailed = true
         break
       }
 

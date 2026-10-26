@@ -50,6 +50,8 @@ export class FakePiRpcProcess {
     this.prompts.push({ message, attachments })
   }
 
+  async clearQueue(): Promise<void> {}
+
   async abort(): Promise<void> {
     this.abortCount += 1
   }

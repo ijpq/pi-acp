@@ -66,7 +66,7 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
   )
 
   assert.deepEqual(sessions.closeCalls, ['s-auth'])
-  assert.equal(existsSync(sessionFile), false)
+  assert.equal(existsSync(sessionFile), true)
   assert.equal(store.get('s-auth'), null)
 })
 
@@ -139,7 +139,7 @@ for (const failure of ['discovery', 'auth', 'invalid-current', 'inconsistent-cur
       code: failure === 'auth' ? -32000 : -32603
     })
     assert.deepEqual(sessions.closeCalls, ['failed'])
-    assert.equal(existsSync(sessionFile), false)
+    assert.equal(existsSync(sessionFile), true)
     assert.equal(store.get('failed'), null)
     assert.equal(existsSync(existingFile), true)
     assert.equal(store.get('existing')?.sessionFile, existingFile)

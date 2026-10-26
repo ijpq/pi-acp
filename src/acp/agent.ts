@@ -21,10 +21,15 @@ import {
   type SetSessionModeResponse,
   type StopReason,
   type DeleteSessionRequest,
+  type ForkSessionRequest,
+  type ResumeSessionRequest,
+  type CloseSessionRequest,
+  type ContentBlock,
   type DeleteSessionResponse
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
+import { verifyNativeIdentity } from './identity.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession, readPiSessionTitle } from './pi-sessions.js'
@@ -145,21 +150,17 @@ export class PiAcpAgent implements ACPAgent {
         ? state.sessionFile
         : this.store.get(sessionId)?.sessionFile
 
-    if (typeof sessionFile === 'string' && sessionFile.trim()) {
-      try {
-        if (existsSync(sessionFile)) unlinkSync(sessionFile)
-      } catch {
-        // ignore cleanup failures; the auth/internal error is the primary result
-      }
-    }
+    // Preserve the native file even on initialization failure. A concurrent
+    // provider/extension may already have persisted a first user message.
+    void sessionFile
 
     this.store.delete(sessionId)
   }
 
-  private findStoredSession(sessionId: string): { cwd: string; sessionFile: string } | null {
+  private findStoredSession(sessionId: string): { cwd: string; sessionFile: string; nativeSessionId?: string } | null {
     const stored = this.store.get(sessionId)
     if (stored?.cwd && stored?.sessionFile) {
-      return { cwd: stored.cwd, sessionFile: stored.sessionFile }
+      return { cwd: stored.cwd, sessionFile: stored.sessionFile, nativeSessionId: stored.nativeSessionId }
     }
 
     const piSession = findPiSession(sessionId)
@@ -194,13 +195,14 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       const cwd = opts?.cwd ?? stored.cwd
-
       let proc: PiRpcProcess
       try {
         proc = await PiRpcProcess.spawn({
           cwd,
           sessionPath: stored.sessionFile,
-          piCommand: process.env.PI_ACP_PI_COMMAND
+          piCommand: process.env.PI_ACP_PI_COMMAND,
+          ...(opts?.mcpServers?.length ? { mcpServers: opts.mcpServers } : {}),
+          ...(stored.nativeSessionId ? { expectedNativeSessionId: stored.nativeSessionId } : {})
         })
       } catch (e: any) {
         if (e?.name === 'PiRpcSpawnError') {
@@ -219,7 +221,14 @@ export class PiAcpAgent implements ACPAgent {
       })
 
       this.lastSessionCwd = cwd
-      this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile })
+      this.store.upsert({
+        sessionId,
+        cwd,
+        sessionFile: stored.sessionFile,
+        ...(proc.nativeIdentity && proc.nativeIdentity.sessionId !== sessionId
+          ? { nativeSessionId: proc.nativeIdentity.sessionId }
+          : {})
+      })
 
       const title = readPiSessionTitle(stored.sessionFile)
       if (title) await session.publishTitle(title, null)
@@ -253,9 +262,13 @@ export class PiAcpAgent implements ACPAgent {
       authMethods: getAuthMethods({
         supportsTerminalAuthMeta: (params as any)?.clientCapabilities?._meta?.['terminal-auth'] === true
       }),
+      _meta: {
+        steering: { supported: true, promptRequired: true },
+        codegPi: { version: 1, runtimeMinimum: '1.4.0', nativeMcp: true, identityVerified: true }
+      },
       agentCapabilities: {
         loadSession: true,
-        mcpCapabilities: { http: false, sse: false },
+        mcpCapabilities: { http: true, sse: false },
         promptCapabilities: {
           image: true,
           audio: false,
@@ -265,7 +278,10 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {},
-          delete: {}
+          delete: {},
+          fork: {},
+          resume: {},
+          close: {}
         }
       }
     }
@@ -886,12 +902,70 @@ export class PiAcpAgent implements ACPAgent {
 
     const result = await session.prompt(message, images, promptToSessionTitle(params.prompt) ?? undefined)
 
-    // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
-    // unless we know this was a cancellation.
-    const stopReason: StopReason =
-      result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
+    if (result === 'error' && !session.wasCancelRequested()) {
+      throw RequestError.internalError(
+        { code: 'PI_EXECUTION_FAILED' },
+        'Pi execution failed; inspect provider and tool diagnostics'
+      )
+    }
+    const stopReason: StopReason = result === 'error' ? 'cancelled' : result
 
     return { stopReason }
+  }
+
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId : ''
+    const session = await this.restoreSession(sessionId)
+    if (method === '_pi/identity') {
+      return { acpSessionId: sessionId, ...verifyNativeIdentity(await session.proc.getState(), session.cwd) }
+    }
+    if (method !== '_session/steering' && method !== '_pi/follow_up') throw RequestError.methodNotFound(method)
+    if (!session.isRunning()) throw RequestError.invalidParams({}, 'CODEG_STEER_NO_ACTIVE_TURN')
+    if (!Array.isArray(params.prompt)) throw RequestError.invalidParams('prompt must be content blocks')
+    const { message, images } = promptToPiMessage(params.prompt as ContentBlock[])
+    if (!message.trim() && !images.length) throw RequestError.invalidParams('Empty steering message')
+    const disposition = await session.proc.steer(message, images, method === '_pi/follow_up')
+    return { outcome: 'injected', disposition }
+  }
+
+  async resumeSession(params: ResumeSessionRequest) {
+    const session = await this.restoreSession(params.sessionId, params)
+    return getSessionConfiguration(session.proc)
+  }
+
+  async closeSession(params: CloseSessionRequest) {
+    if (this.sessions.maybeGet(params.sessionId)?.isRunning()) throw RequestError.invalidParams({}, 'PI_SESSION_BUSY')
+    this.sessions.close(params.sessionId)
+    return {}
+  }
+
+  async unstable_forkSession(params: ForkSessionRequest) {
+    // Pi clone operates on the process it is sent to. Use a separate verified
+    // reader so the source writer and ACP binding never change.
+    const source = await this.restoreSession(params.sessionId)
+    if (source.isRunning()) throw RequestError.invalidParams({}, 'PI_SESSION_BUSY')
+    const point = (params._meta as Record<string, unknown> | undefined)?.['jetbrains.air']
+    if (point && typeof point === 'object' && 'fork' in point) {
+      throw RequestError.invalidParams('PI_FORK_POINT_UNSUPPORTED: only an immutable current-tail clone is supported')
+    }
+    const expected = verifyNativeIdentity(await source.proc.getState(), source.cwd)
+    const proc = await PiRpcProcess.spawn({
+      cwd: source.cwd,
+      sessionPath: expected.sessionFile,
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      mcpServers: params.mcpServers
+    })
+    try {
+      verifyNativeIdentity(await proc.getState(), source.cwd, expected)
+      await proc.clone()
+      const identity = verifyNativeIdentity(await proc.getState(), source.cwd)
+      if (identity.sessionId === expected.sessionId || identity.sessionFile === expected.sessionFile)
+        throw new Error('PI_FORK_NOT_INDEPENDENT')
+      this.store.upsert({ ...identity, nativeSessionId: identity.sessionId })
+      return { sessionId: identity.sessionId, ...(await getSessionConfiguration(proc)) }
+    } finally {
+      proc.dispose()
+    }
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -937,8 +1011,10 @@ export class PiAcpAgent implements ACPAgent {
     // If the client is re-loading a session that is already active, tear down the existing
     // pi subprocess so we can start fresh and re-advertise commands reliably.
     // (Some clients may call session/load when restoring from history.)
-    this.sessions.close(params.sessionId)
-
+    if (this.sessions.maybeGet(params.sessionId)?.isRunning()) {
+      throw RequestError.invalidParams('PI_SESSION_BUSY: cannot reload an executing session')
+    }
+    // Concurrent restores join restoreSession rather than closing its successful writer.
     this.lastSessionCwd = params.cwd
 
     const stored = this.findStoredSession(params.sessionId)
@@ -965,13 +1041,6 @@ export class PiAcpAgent implements ACPAgent {
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
     // (Tests sometimes stub out `this.sessions`, so guard the call.)
     ;(this.sessions as any).closeAllExcept?.(session.sessionId)
-
-    // (Optional) ensure mapping stays fresh.
-    this.store.upsert({
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      sessionFile: stored.sessionFile
-    })
 
     // Replay full conversation history.
     const data = (await proc.getMessages()) as any

@@ -10,13 +10,13 @@ function writeFakePi(root: string): string {
   writeFileSync(
     fixture,
     [
-      "const { appendFileSync } = require('node:fs')",
+      "const { appendFileSync, readFileSync } = require('node:fs')",
       "const readline = require('node:readline')",
       "const sessionPath = process.argv[process.argv.indexOf('--session') + 1]",
       "appendFileSync(sessionPath, 'started\\n')",
       "readline.createInterface({ input: process.stdin }).on('line', line => {",
       '  const command = JSON.parse(line)',
-      "  process.stdout.write(JSON.stringify({ type: 'response', id: command.id, command: command.type, success: true, data: { sessionFile: sessionPath } }) + '\\n')",
+      "  process.stdout.write(JSON.stringify({ type: 'response', id: command.id, command: command.type, success: true, data: { commands: [{name:'codeg-pi-runtime-v1'}], sessionFile: sessionPath, sessionId: JSON.parse(readFileSync(sessionPath, 'utf8').split('\\n')[0]).id } }) + '\\n')",
       '  setTimeout(() => process.exit(0), 20)',
       '})'
     ].join('\n')
@@ -49,12 +49,13 @@ test('PiRpcProcess passes distinct session paths intact to the pi launcher', asy
       const second = join(sessionDir, `${launcherName}-second.jsonl`)
 
       for (const sessionPath of [first, second]) {
+        writeFileSync(sessionPath, JSON.stringify({ type: 'session', id: 'fixture', cwd: root }) + '\n')
         const proc = await PiRpcProcess.spawn({ cwd: root, piCommand: launcher, sessionPath })
         proc.dispose()
       }
 
-      assert.equal(readFileSync(first, 'utf8'), 'started\n')
-      assert.equal(readFileSync(second, 'utf8'), 'started\n')
+      assert.ok(readFileSync(first, 'utf8').endsWith('started\n'))
+      assert.ok(readFileSync(second, 'utf8').endsWith('started\n'))
       assert.equal(existsSync(join(root, 'project')), false)
     }
   } finally {
@@ -77,13 +78,14 @@ test(
     const sessionDir = join(root, 'my project')
     mkdirSync(sessionDir)
     const sessionPath = join(sessionDir, 'restored.jsonl')
+    writeFileSync(sessionPath, JSON.stringify({ type: 'session', id: 'fixture', cwd: root }) + '\n')
     const originalPlatform = process.platform
 
     try {
       Object.defineProperty(process, 'platform', { value: 'win32' })
       const proc = await PiRpcProcess.spawn({ cwd: root, piCommand: launcher, sessionPath })
       proc.dispose()
-      assert.equal(readFileSync(sessionPath, 'utf8'), 'started\n')
+      assert.ok(readFileSync(sessionPath, 'utf8').endsWith('started\n'))
     } finally {
       Object.defineProperty(process, 'platform', { value: originalPlatform })
       await new Promise(resolve => setTimeout(resolve, 50))

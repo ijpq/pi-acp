@@ -1,0 +1,25 @@
+name: Verify CodeG Pi adapter
+on:
+  push:
+    branches: [codeg-native-pi-v1]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --ignore-scripts

@@ -1,11 +1,14 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { getPiAcpSessionMapPath } from './paths.js'
 
 export type StoredSession = {
   sessionId: string
   cwd: string
   sessionFile: string
+  nativeSessionId?: string
   updatedAt: string
 }
 
@@ -31,11 +34,6 @@ function loadFile(path: string): SessionMapFile {
   }
 }
 
-function saveFile(path: string, data: SessionMapFile): void {
-  ensureParentDir(path)
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n', 'utf-8')
-}
-
 export class SessionStore {
   private readonly path: string
 
@@ -44,25 +42,34 @@ export class SessionStore {
   }
 
   get(sessionId: string): StoredSession | null {
+    const path = this.entryPath(sessionId)
+    if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8')) as StoredSession | null
     const db = loadFile(this.path)
-    return db.sessions[sessionId] ?? null
+    if (db.sessions[sessionId]) return db.sessions[sessionId]
+    // A custom Pi profile used to share the home-level adapter map. Import
+    // its explicit association lazily; the native process verifies it on load.
+    if (this.path !== getPiAcpSessionMapPath()) return null
+    const legacyPath = join(homedir(), '.pi', 'pi-acp', 'session-map.json')
+    return legacyPath !== this.path ? (loadFile(legacyPath).sessions[sessionId] ?? null) : null
   }
 
-  upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
-    const db = loadFile(this.path)
-    db.sessions[entry.sessionId] = {
-      sessionId: entry.sessionId,
-      cwd: entry.cwd,
-      sessionFile: entry.sessionFile,
-      updatedAt: new Date().toISOString()
-    }
-    saveFile(this.path, db)
+  private entryPath(sessionId: string): string {
+    return join(this.path + '.d', createHash('sha256').update(sessionId).digest('hex') + '.json')
+  }
+
+  private write(sessionId: string, value: StoredSession | null): void {
+    const path = this.entryPath(sessionId)
+    ensureParentDir(path)
+    const temporary = path + '.' + crypto.randomUUID() + '.tmp'
+    writeFileSync(temporary, JSON.stringify(value) + '\n', { mode: 0o600 })
+    renameSync(temporary, path)
+  }
+
+  upsert(entry: { sessionId: string; cwd: string; sessionFile: string; nativeSessionId?: string }): void {
+    this.write(entry.sessionId, { ...entry, updatedAt: new Date().toISOString() })
   }
 
   delete(sessionId: string): void {
-    const db = loadFile(this.path)
-    if (!db.sessions[sessionId]) return
-    delete db.sessions[sessionId]
-    saveFile(this.path, db)
+    this.write(sessionId, null)
   }
 }

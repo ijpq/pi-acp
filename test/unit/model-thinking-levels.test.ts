@@ -167,6 +167,8 @@ for (const load of [false, true]) {
   for (const levels of [['off'], ['low', 'high', 'max'], ['ordinary', 'mean']]) {
     test(`${load ? 'load' : 'new'} session advertises exact ${levels} levels`, async t => {
       const { agent, proc, state } = fixture()
+      const active = Reflect.get(agent, 'sessions').maybeGet('s1')
+      if (active) active.isRunning = () => false
       state.thinkingLevel = levels[levels.length - 1]
       proc.getAvailableThinkingLevels = async () => levels
       t.mock.method(globalThis, 'setTimeout', () => 0 as unknown as ReturnType<typeof setTimeout>)

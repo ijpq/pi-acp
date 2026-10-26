@@ -38,6 +38,7 @@ function readSessionDirFromSettings(agentDir: string): string | null {
 }
 
 export function getPiSessionsDir(): string {
+  if (process.env.PI_CODING_AGENT_SESSION_DIR) return resolve(process.env.PI_CODING_AGENT_SESSION_DIR)
   const agentDir = getPiAgentDir()
   return readSessionDirFromSettings(agentDir) ?? join(agentDir, 'sessions')
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-acp",
-  "version": "0.0.34",
+  "version": "0.0.34-codeg.1",
   "description": "ACP adapter for pi coding agent",
   "license": "MIT",
   "author": "Sergii Kozak <svkozak@gmail.com>",
@@ -23,7 +23,7 @@
     "adapter"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "type": "module",
   "main": "dist/index.js",
@@ -31,7 +31,9 @@
     "pi-acp": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "CODEG.md",
+    "LICENSE"
   ],
   "scripts": {
     "dev": "tsx src/index.ts",
