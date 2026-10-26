@@ -48,7 +48,10 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
   ;(PiRpcProcess as any).spawn = async (params: any) => {
     spawnCalls.push(params)
     return {
-      onEvent: () => () => {}
+      onEvent: () => () => {},
+      getState: async () => ({ thinkingLevel: 'medium', model: { provider: 'test', id: 'model' } }),
+      getAvailableThinkingLevels: async () => ['medium'],
+      getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'model' }] })
     } as any
   }
 
@@ -130,6 +133,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
     sessionId,
     cwd: params.cwd,
     proc: params.proc,
+    configure: async <T>(action: () => Promise<T>) => action(),
     async publishContextUsage() {
       // Context usage publishing is covered in test/unit/context-usage.test.ts.
     }

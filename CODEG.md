@@ -41,3 +41,22 @@ companion, not by an instruction claiming that Pi spawned a child. Authenticatio
 models, skills, extensions and workspaces remain owned by the user and are not
 copied between engines. CodeG's external-message idempotency and durable queue
 are owned by CodeG, not this ACP adapter.
+
+`service_tier` is a separate ACP config option for established GPT/o-series
+models on `openai-responses` and `openai-codex-responses`. Pi RPC has no native
+tier setter: a bundled native extension uses `before_provider_request` to set
+the actual payload's `service_tier` to `default` (off) or `priority` (on).
+It does not alter reasoning. Choices are private adapter preferences per
+session, provider, model, API and endpoint, independent of Pi credentials.
+Changes use a native extension command with a nonce-matched acknowledgement;
+the command does not become a user message. Model, thinking and tier changes
+are serialized and rejected during an active task. Unsupported interfaces and
+models show an unavailable option and reject attempts to enable it.
+
+The last raw `response.completed.response.service_tier` is recorded separately
+from the requested value. Missing fields remain unverified; Pi's usage/pricing
+fallback to the requested tier is never taken as evidence. For a relay the
+field is labelled endpoint-reported, with upstream unverified. A differing
+returned tier is shown verbatim. Provider failures do not retry without the
+requested tier. No speed or relay billing claim is inferred. The option is off
+by default and warns of potentially higher provider/relay charges or quota use.

@@ -316,6 +316,26 @@ export class PiAcpSession {
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
   private readonly turnQueue: QueuedTurn[] = []
+  private configuration: Promise<void> = Promise.resolve()
+  private configurationPending = 0
+
+  async configure<T>(action: () => Promise<T>): Promise<T> {
+    this.configurationPending++
+    const previous = this.configuration
+    let release!: () => void
+    this.configuration = new Promise<void>(resolve => {
+      release = resolve
+    })
+    await previous
+    try {
+      if (this.isRunning())
+        throw RequestError.invalidParams({}, 'PI_SETTINGS_BUSY: wait for the current task to finish')
+      return await action()
+    } finally {
+      this.configurationPending--
+      release()
+    }
+  }
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -379,6 +399,7 @@ export class PiAcpSession {
   }
 
   async prompt(message: string, images: unknown[] = [], title?: string): Promise<StopReason> {
+    if (this.configurationPending > 0) await this.configuration
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 

@@ -30,6 +30,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
   try {
     const conn = new FakeAgentSideConnection()
     const session = {
+      configure: async <T>(action: () => Promise<T>) => action(),
       sessionId: 's1',
       cwd: process.cwd(),
       proc: {
@@ -62,37 +63,40 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
 
     assert.equal(result.models?.currentModelId, 'test/beta')
     assert.equal(result.modes?.currentModeId, 'high')
-    assert.deepEqual(result.configOptions, [
-      {
-        type: 'select',
-        id: 'model',
-        category: 'model',
-        name: 'Model',
-        description: 'Select the model for this session',
-        currentValue: 'test/beta',
-        options: [
-          { value: 'test/alpha', name: 'test/Alpha', description: null },
-          { value: 'test/beta', name: 'test/Beta', description: null }
-        ]
-      },
-      {
-        type: 'select',
-        id: 'thought_level',
-        category: 'thought_level',
-        name: 'Thinking',
-        description: 'Set the reasoning effort for this session',
-        currentValue: 'high',
-        options: [
-          { value: 'off', name: 'Thinking: off', description: null },
-          { value: 'minimal', name: 'Thinking: minimal', description: null },
-          { value: 'low', name: 'Thinking: low', description: null },
-          { value: 'medium', name: 'Thinking: medium', description: null },
-          { value: 'high', name: 'Thinking: high', description: null },
-          { value: 'xhigh', name: 'Thinking: xhigh', description: null },
-          { value: 'max', name: 'Thinking: max', description: null }
-        ]
-      }
-    ])
+    assert.deepEqual(
+      result.configOptions?.filter(option => option.id !== 'service_tier'),
+      [
+        {
+          type: 'select',
+          id: 'model',
+          category: 'model',
+          name: 'Model',
+          description: 'Select the model for this session',
+          currentValue: 'test/beta',
+          options: [
+            { value: 'test/alpha', name: 'test/Alpha', description: null },
+            { value: 'test/beta', name: 'test/Beta', description: null }
+          ]
+        },
+        {
+          type: 'select',
+          id: 'thought_level',
+          category: 'thought_level',
+          name: 'Thinking',
+          description: 'Set the reasoning effort for this session',
+          currentValue: 'high',
+          options: [
+            { value: 'off', name: 'Thinking: off', description: null },
+            { value: 'minimal', name: 'Thinking: minimal', description: null },
+            { value: 'low', name: 'Thinking: low', description: null },
+            { value: 'medium', name: 'Thinking: medium', description: null },
+            { value: 'high', name: 'Thinking: high', description: null },
+            { value: 'xhigh', name: 'Thinking: xhigh', description: null },
+            { value: 'max', name: 'Thinking: max', description: null }
+          ]
+        }
+      ]
+    )
   } finally {
     ;(globalThis as any).setTimeout = realSetTimeout
   }
@@ -107,6 +111,7 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
   const setModelCalls: Array<{ provider: string; modelId: string }> = []
 
   const session = {
+    configure: async <T>(action: () => Promise<T>) => action(),
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {
@@ -166,6 +171,7 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
   const thinkingLevels: string[] = []
 
   const session = {
+    configure: async <T>(action: () => Promise<T>) => action(),
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {

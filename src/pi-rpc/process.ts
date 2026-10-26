@@ -5,6 +5,11 @@ import { fileURLToPath } from 'node:url'
 import { readNativeIdentity, verifyNativeIdentity, type NativeIdentity } from '../acp/identity.js'
 import { existsSync } from 'node:fs'
 import crossSpawn from 'cross-spawn'
+import { createHash, randomUUID } from 'node:crypto'
+import { join } from 'node:path'
+import { getPiAcpDir } from '../acp/paths.js'
+import { type TierChoice } from '../service-tier.js'
+import { readFileSync } from 'node:fs'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
 export class PiRpcSpawnError extends Error {
@@ -115,6 +120,7 @@ type SpawnParams = {
 
 export class PiRpcProcess {
   nativeIdentity?: NativeIdentity
+  tierFile?: string
   private readonly child: ChildProcessWithoutNullStreams
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
@@ -185,6 +191,14 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     const env = { ...process.env }
+    const tierFile = join(
+      getPiAcpDir(),
+      'service-tiers',
+      createHash('sha256')
+        .update(params.sessionPath ?? randomUUID())
+        .digest('hex') + '.json'
+    )
+    env.PI_ACP_TIER_FILE = tierFile
     {
       const servers: Record<string, unknown> = {}
       for (const server of params.mcpServers ?? []) {
@@ -260,6 +274,7 @@ export class PiRpcProcess {
     })
 
     const proc = new PiRpcProcess(child)
+    proc.tierFile = tierFile
 
     try {
       proc.nativeIdentity = verifyNativeIdentity(await proc.getState(), params.cwd, expected)
@@ -336,6 +351,20 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'get_state' })
     if (!res.success) throw new Error(`pi get_state failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
+  }
+
+  async setServiceTier(choice: TierChoice): Promise<void> {
+    if (!this.tierFile) throw new Error('PI_SERVICE_TIER_BRIDGE_UNAVAILABLE')
+    const nonce = randomUUID()
+    const disposition = await this.prompt('/codeg-service-tier-v1 ' + JSON.stringify({ nonce, choice }))
+    if (disposition !== 'handled') throw new Error('PI_SERVICE_TIER_NOT_CONFIRMED')
+    const ack = JSON.parse(readFileSync(this.tierFile + '.ack', 'utf8')) as {
+      nonce?: string
+      ok?: boolean
+      error?: string
+    }
+    if (ack.nonce !== nonce || !ack.ok)
+      throw new Error(ack.nonce === nonce ? (ack.error ?? 'PI_SERVICE_TIER_FAILED') : 'PI_SERVICE_TIER_STALE_ACK')
   }
 
   async getAvailableModels(): Promise<unknown> {

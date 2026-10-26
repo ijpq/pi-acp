@@ -35,6 +35,7 @@ function fixture() {
     }
   }
   const session = {
+    configure: async <T>(action: () => Promise<T>) => action(),
     sessionId: 's1',
     cwd: process.cwd(),
     proc,

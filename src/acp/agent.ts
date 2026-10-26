@@ -32,6 +32,7 @@ import { SessionManager, type PiAcpSession } from './session.js'
 import { verifyNativeIdentity } from './identity.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
+import { serviceTierState, tierDescription, type TierModel } from '../service-tier.js'
 import { listPiSessions, findPiSession, readPiSessionTitle } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
@@ -264,7 +265,18 @@ export class PiAcpAgent implements ACPAgent {
       }),
       _meta: {
         steering: { supported: true, promptRequired: true },
-        codegPi: { version: 1, runtimeMinimum: '1.4.0', nativeMcp: true, identityVerified: true }
+        codegPi: {
+          version: 1,
+          runtimeMinimum: '1.4.0',
+          nativeMcp: true,
+          identityVerified: true,
+          serviceTier: {
+            version: 1,
+            configId: 'service_tier',
+            apis: ['openai-responses', 'openai-codex-responses'],
+            runningChanges: 'reject'
+          }
+        }
       },
       agentCapabilities: {
         loadSession: true,
@@ -901,6 +913,7 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const result = await session.prompt(message, images, promptToSessionTitle(params.prompt) ?? undefined)
+    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
 
     if (result === 'error' && !session.wasCancelRequested()) {
       throw RequestError.internalError(
@@ -1215,7 +1228,7 @@ export class PiAcpAgent implements ACPAgent {
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
     const session = await this.restoreSession(params.sessionId)
-    await setSessionModel(session.proc, params.modelId)
+    await session.configure(() => setSessionModel(session.proc, params.modelId))
     await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
     await session.publishContextUsage()
   }
@@ -1228,7 +1241,7 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams('Expected nonempty string modeId')
     }
 
-    await session.proc.setThinkingLevel(mode)
+    await session.configure(() => session.proc.setThinkingLevel(mode))
 
     await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
 
@@ -1244,18 +1257,23 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`Expected string value for config option: ${configId}`)
     }
 
-    if (configId === MODEL_CONFIG_ID) {
-      await setSessionModel(session.proc, params.value)
-      modelChanged = true
-    } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
-      if (params.value.length === 0) {
-        throw RequestError.invalidParams('Expected nonempty thinking level')
-      }
+    await session.configure(async () => {
+      if (configId === MODEL_CONFIG_ID) {
+        await setSessionModel(session.proc, params.value)
+        modelChanged = true
+      } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
+        if (params.value.length === 0) {
+          throw RequestError.invalidParams('Expected nonempty thinking level')
+        }
 
-      await session.proc.setThinkingLevel(params.value)
-    } else {
-      throw RequestError.invalidParams(`Unknown config option: ${configId}`)
-    }
+        await session.proc.setThinkingLevel(params.value)
+      } else if (configId === 'service_tier') {
+        if (params.value !== 'on' && params.value !== 'off') throw RequestError.invalidParams('Expected on or off')
+        await session.proc.setServiceTier(params.value)
+      } else {
+        throw RequestError.invalidParams(`Unknown config option: ${configId}`)
+      }
+    })
 
     const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
     // A different model can mean a different context window; refresh it immediately.
@@ -1314,8 +1332,25 @@ async function getSessionConfiguration(
   const state = pre?.state ?? (await proc.getState())
   const [models, modes] = await Promise.all([getModelState(proc, { ...pre, state }), getThinkingState(proc, { state })])
 
+  const model = state?.model as TierModel | undefined
+  const tier = serviceTierState(proc.tierFile, model ?? {})
+  const configOptions = buildConfigOptions({ models, modes })
+  configOptions.push({
+    type: 'select',
+    id: 'service_tier',
+    category: 'model_config',
+    name: 'Fast / Speed',
+    currentValue: tier.choice,
+    description: tier.supported ? tierDescription(tier.observation) : tier.reason,
+    options: tier.supported
+      ? [
+          { value: 'off', name: 'Off', description: tierDescription(tier.observation) },
+          { value: 'on', name: 'On', description: tierDescription(tier.observation) }
+        ]
+      : [{ value: 'off', name: 'Unavailable', description: tier.reason }]
+  })
   return {
-    configOptions: buildConfigOptions({ models, modes }),
+    configOptions,
     models,
     modes
   }
