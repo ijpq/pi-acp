@@ -1,9 +1,14 @@
-# CodeG distribution: 0.0.34-codeg.1
+# CodeG distribution: 0.0.34-codeg.2
 
 Based on svkozak/pi-acp (MIT), retaining upstream copyright and license.
 Requires Node >=22.19.0 and Pi >=1.4.0. CodeG ships a private Node 24.16.0,
 Pi 1.4.0 and this adapter as a versioned group; no global npm installation or
 credential migration is required.
+
+Runtime diagnostics and the startup version probe the selected RPC executable,
+with a bounded timeout; `_pi/identity.runtime` reports its path and verified
+version. A custom runtime never borrows a global Pi version or changelog.
+This distribution has no global-npm update notice: upgrade the CodeG runtime group.
 
 `session/new` asks Pi to initialize an exclusively allocated empty file, then
 compares `get_state` with the native file header before advertising ready.

@@ -32,6 +32,7 @@ import { SessionManager, type PiAcpSession } from './session.js'
 import { verifyNativeIdentity } from './identity.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
+import { piRuntimeInfo, selectedPiChangelog } from '../pi-rpc/runtime-info.js'
 import { serviceTierState, tierDescription, type TierModel } from '../service-tier.js'
 import { listPiSessions, findPiSession, readPiSessionTitle } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
@@ -387,7 +388,8 @@ export class PiAcpAgent implements ACPAgent {
     const { configOptions, models, modes } = configuration
 
     const quietStartup = getQuietStartup(params.cwd)
-    const updateNotice = buildUpdateNotice()
+    // This distribution upgrades with CodeG as a versioned runtime group.
+    const updateNotice = null
 
     // If quietStartup is enabled, suppress the full "startup info" prelude, but still surface
     // the "New version available" notice (if any) since it's high-signal and actionable.
@@ -688,6 +690,7 @@ export class PiAcpAgent implements ACPAgent {
       if (cmd === 'changelog') {
         // Read pi's installed CHANGELOG.md. Adapter-side, no model call.
         const findChangelog = (): string | null => {
+          if (process.env.PI_ACP_PI_COMMAND) return selectedPiChangelog(process.env.PI_ACP_PI_COMMAND)
           // 1) Locate the installed pi package by resolving the `pi` executable.
           // On Node installs, `pi` typically resolves to .../@earendil-works/pi-coding-agent/dist/cli.js
           try {
@@ -930,7 +933,11 @@ export class PiAcpAgent implements ACPAgent {
     const sessionId = typeof params.sessionId === 'string' ? params.sessionId : ''
     const session = await this.restoreSession(sessionId)
     if (method === '_pi/identity') {
-      return { acpSessionId: sessionId, ...verifyNativeIdentity(await session.proc.getState(), session.cwd) }
+      return {
+        acpSessionId: sessionId,
+        ...verifyNativeIdentity(await session.proc.getState(), session.cwd),
+        runtime: piRuntimeInfo()
+      }
     }
     if (method !== '_session/steering' && method !== '_pi/follow_up') throw RequestError.methodNotFound(method)
     if (!session.isRunning()) throw RequestError.invalidParams({}, 'CODEG_STEER_NO_ACTIVE_TURN')
@@ -1526,58 +1533,6 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
   await proc.setModel(provider, modelId)
 }
 
-function isSemver(v: string): boolean {
-  return /^\d+\.\d+\.\d+(?:[-+].+)?$/.test(v)
-}
-
-function compareSemver(a: string, b: string): number {
-  // Very small comparator for x.y.z (ignores pre-release/build beyond making them "not greater" unless base differs)
-  const pa = a
-    .split(/[.-]/)
-    .slice(0, 3)
-    .map(n => Number(n))
-  const pb = b
-    .split(/[.-]/)
-    .slice(0, 3)
-    .map(n => Number(n))
-  for (let i = 0; i < 3; i++) {
-    const da = pa[i] ?? 0
-    const db = pb[i] ?? 0
-    if (da > db) return 1
-    if (da < db) return -1
-  }
-  return 0
-}
-
-function buildUpdateNotice(): string | null {
-  // Best-effort update check against npm registry.
-  // Important: keep it fast to not slow down session/new.
-  try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
-    const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
-      /^v/i,
-      ''
-    )
-
-    if (!installed || !isSemver(installed)) return null
-
-    const latestRes = spawnSync('npm', ['view', '@earendil-works/pi-coding-agent', 'version'], {
-      encoding: 'utf-8',
-      timeout: 800
-    })
-    const latest = String(latestRes.stdout ?? '')
-      .trim()
-      .replace(/^v/i, '')
-
-    if (!latest || !isSemver(latest)) return null
-    if (compareSemver(latest, installed) <= 0) return null
-
-    return `New version available: v${latest} (installed v${installed}). Run: \`npm i -g @earendil-works/pi-coding-agent\``
-  } catch {
-    return null
-  }
-}
-
 function buildStartupInfo(opts: {
   cwd: string
   fileCommands: ReturnType<typeof loadSlashCommands>
@@ -1587,21 +1542,9 @@ function buildStartupInfo(opts: {
 
   const md: string[] = []
 
-  // pi version header
-  try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
-    const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
-      /^v/i,
-      ''
-    )
-    if (installed) {
-      md.push(`pi v${installed}`)
-      md.push('---')
-      md.push('')
-    }
-  } catch {
-    // ignore
-  }
+  const runtime = piRuntimeInfo()
+  md.push(runtime.version ? `pi v${runtime.version}` : 'Pi version unverified (selected runtime)')
+  md.push('---', '')
 
   const addSection = (title: string, items: string[]) => {
     const cleaned = items.map(s => s.trim()).filter(Boolean)
