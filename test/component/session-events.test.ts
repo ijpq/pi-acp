@@ -143,7 +143,9 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
 
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+  assert.deepEqual((conn.updates[0]!.update as any).locations, [
+    { path: join(process.cwd(), 'src', 'acp', 'session.ts') }
+  ])
 })
 
 test('PiAcpSession: handles extension select via ACP permission request', async () => {
