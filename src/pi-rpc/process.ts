@@ -126,6 +126,7 @@ export class PiRpcProcess {
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
+  private compacting = false
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
@@ -153,6 +154,8 @@ export class PiRpcProcess {
         return
       }
 
+      if (msg?.type === 'compaction_start' || msg?.type === 'auto_compaction_start') this.compacting = true
+      if (msg?.type === 'compaction_end' || msg?.type === 'auto_compaction_end') this.compacting = false
       for (const h of this.eventHandlers) h(msg as PiRpcEvent)
     }
     child.stdout.on('data', (chunk: Buffer) => {
@@ -320,7 +323,8 @@ export class PiRpcProcess {
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<string | undefined> {
-    const res = await this.request({ type: 'prompt', message, images })
+    // Pi 1.4 acknowledges only after preflight, which can include native compaction.
+    const res = await this.request({ type: 'prompt', message, images }, { compactionAware: true })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
     return (res.data as { disposition?: string } | undefined)?.disposition
   }
@@ -347,6 +351,35 @@ export class PiRpcProcess {
   async abort(): Promise<void> {
     const res = await this.request({ type: 'abort' })
     if (!res.success) throw new Error(`pi abort failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  async stopExecution(): Promise<void> {
+    try {
+      await this.clearQueue()
+      // The native abort response is sent only once the session is idle.
+      await this.abort()
+    } catch (error) {
+      if (this.child.exitCode !== null && this.child.exitCode !== undefined) return
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('PI_STOP_UNCONFIRMED: native process did not exit', { cause: error })),
+          5_000
+        )
+        this.child.once('exit', () => {
+          clearTimeout(timer)
+          resolve()
+        })
+        try {
+          if (!this.child.kill('SIGKILL')) {
+            clearTimeout(timer)
+            reject(new Error('PI_STOP_UNCONFIRMED: native process could not be terminated', { cause: error }))
+          }
+        } catch (failure) {
+          clearTimeout(timer)
+          reject(failure)
+        }
+      })
+    }
   }
 
   async getState(): Promise<unknown> {
@@ -413,7 +446,7 @@ export class PiRpcProcess {
   }
 
   async compact(customInstructions?: string): Promise<unknown> {
-    const res = await this.request({ type: 'compact', customInstructions })
+    const res = await this.request({ type: 'compact', customInstructions }, { compactionAware: true })
     if (!res.success) throw new Error(`pi compact failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
@@ -462,7 +495,7 @@ export class PiRpcProcess {
     await this.writeLine(`${JSON.stringify({ type: 'extension_ui_response', ...response })}\n`)
   }
 
-  private request(cmd: PiRpcCommand, opts?: { timeoutMs?: number }): Promise<PiRpcResponse> {
+  private request(cmd: PiRpcCommand, opts?: { timeoutMs?: number; compactionAware?: boolean }): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
     const timeoutMs = opts?.timeoutMs ?? 30_000
@@ -493,15 +526,30 @@ export class PiRpcProcess {
         }
       })
 
-      if (timeoutMs !== undefined) {
-        timer = setTimeout(() => {
+      const arm = () => {
+        timer = setTimeout(async () => {
           timer = undefined
-          if (!this.pending.delete(id)) return
-          reject(new Error(`pi ${cmd.type} timed out after ${timeoutMs}ms`))
+          if (!this.pending.has(id)) return
+          if (opts?.compactionAware && this.compacting) {
+            try {
+              const health = await this.request({ type: 'get_state' }, { timeoutMs: 5_000 })
+              if (!this.pending.has(id)) return
+              if (!health.success) throw new Error(`Pi compaction health check failed: ${health.error}`)
+              if (!this.compacting || (health.data as { isCompacting?: boolean } | undefined)?.isCompacting === true) {
+                arm()
+                return
+              }
+              throw new Error('PI_COMPACTION_STATE_LOST: Pi is no longer compacting but did not report its outcome')
+            } catch (error) {
+              if (drop()) reject(error)
+              return
+            }
+          }
+          if (drop()) reject(new Error(`pi ${cmd.type} timed out after ${timeoutMs}ms`))
         }, timeoutMs)
-        // Never let an auxiliary request keep the event loop alive.
         timer.unref?.()
       }
+      arm()
 
       void this.writeLine(line).catch(error => {
         if (!drop()) return

@@ -1,4 +1,4 @@
-# CodeG distribution: 0.0.34-codeg.3
+# CodeG distribution: 0.0.34-codeg.4
 
 Based on svkozak/pi-acp (MIT), retaining upstream copyright and license.
 Requires Node >=22.19.0 and Pi >=1.4.0. CodeG ships a private Node 24.16.0,
@@ -69,3 +69,18 @@ by default and warns of potentially higher provider/relay charges or quota use.
 ## Shared canonical skills
 
 CodeG supplies `CODEG_SHARED_SKILL_PATHS_JSON`, a launch-only JSON array of selected-instance Markdown skill directories/files. The adapter resolves paths in the session workspace, deduplicates real paths and passes each original through Pi 1.4.0 native `--skill`. It neither copies skills nor reads another engine's authentication, private memories or extensions. Missing optional roots are ignored; malformed/unreadable configured sources fail explicitly. Pi's own skills and trust settings remain in place; native name collisions retain Pi's documented first source and diagnostics. CodeG delivers shared rules independently of handoff; ledger/skill bodies are read from their canonical paths on demand.
+
+## Native compaction lifecycle
+
+Pi 1.4 emits `compaction_start/end`; legacy `auto_compaction_start/end` remain
+accepted. One structured ACP compaction record carries the native phase, start
+time, duration and completed/failed/cancelled outcome. A verified native JSONL
+entry ID correlates successful live and historical records; no rollout is edited.
+
+Prompt admission occurs after Pi preflight compaction. The ordinary 30-second
+RPC deadline probes `get_state` while native compaction is active instead of
+ending the turn. A failed health check or a missing admission still fails with
+its actual cause, after native abort confirms idle (or the owned child exits).
+Manual `/compact` follows the same queue, cancellation and card lifecycle.
+Provider retries that eventually succeed no longer inherit an earlier error.
+No synthetic percentage, credentials or prompt text is added to diagnostics.

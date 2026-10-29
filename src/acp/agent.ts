@@ -492,28 +492,8 @@ export class PiAcpAgent implements ACPAgent {
 
       if (cmd === 'compact') {
         const customInstructions = args.join(' ').trim() || undefined
-        const res = await session.proc.compact(customInstructions)
-
-        const r: any = res && typeof res === 'object' ? (res as any) : null
-        const tokensBefore = typeof r?.tokensBefore === 'number' ? r.tokensBefore : null
-        const summary = typeof r?.summary === 'string' ? r.summary : null
-
-        const headerLines = [
-          `Compaction completed.${customInstructions ? ' (custom instructions applied)' : ''}`,
-          tokensBefore !== null ? `Tokens before: ${tokensBefore}` : null
-        ].filter(Boolean)
-
-        const text = headerLines.join('\n') + (summary ? `\n\n${summary}` : '')
-
-        await this.conn.sessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
+        const result = await session.compact(customInstructions)
+        return { stopReason: result === 'cancelled' ? 'cancelled' : 'end_turn' }
       }
 
       if (cmd === 'session') {
@@ -921,7 +901,7 @@ export class PiAcpAgent implements ACPAgent {
     if (result === 'error' && !session.wasCancelRequested()) {
       throw RequestError.internalError(
         { code: 'PI_EXECUTION_FAILED' },
-        'Pi execution failed; inspect provider and tool diagnostics'
+        session.executionFailure() ?? 'Pi execution failed without a provider diagnostic'
       )
     }
     const stopReason: StopReason = result === 'error' ? 'cancelled' : result

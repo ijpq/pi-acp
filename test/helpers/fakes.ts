@@ -56,6 +56,11 @@ export class FakePiRpcProcess {
     this.abortCount += 1
   }
 
+  async stopExecution(): Promise<void> {
+    await this.clearQueue()
+    await this.abort()
+  }
+
   async sendExtensionUiResponse(response: unknown): Promise<void> {
     this.extensionUiResponses.push(response)
   }

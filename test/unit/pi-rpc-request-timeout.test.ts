@@ -135,3 +135,40 @@ test('PiRpcProcess: responses with unknown ids are dropped while real events are
 
   assert.deepEqual(events, [{ type: 'agent_start' }])
 })
+
+test('PiRpcProcess: native compaction can delay admission beyond 30 seconds without losing the acknowledgement', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const { child, stdout, written } = makeFakeChild()
+  const proc = makeProcess(child)
+  const prompt = proc.prompt('continue the long history')
+  const accepted = assert.doesNotReject(prompt)
+  const sent = JSON.parse(written[0])
+  stdout.write(JSON.stringify({ type: 'compaction_start', reason: 'threshold' }) + '\n')
+  t.mock.timers.tick(30_001)
+  await Promise.resolve()
+  const health = written.map(line => JSON.parse(line)).find(command => command.type === 'get_state')
+  assert.ok(health, 'Confirm that the subprocess is still compacting rather than blindly extending a timeout')
+  stdout.write(
+    JSON.stringify({
+      type: 'response',
+      command: 'get_state',
+      id: health.id,
+      success: true,
+      data: { isCompacting: true }
+    }) + '\n'
+  )
+  await Promise.resolve()
+  stdout.write(JSON.stringify({ type: 'compaction_end', reason: 'threshold', aborted: false }) + '\n')
+  stdout.write(
+    JSON.stringify({
+      type: 'response',
+      command: 'prompt',
+      id: sent.id,
+      success: true,
+      data: { disposition: 'started' }
+    }) + '\n'
+  )
+  assert.equal(await prompt, 'started')
+  await accepted
+  assert.equal(pendingSize(proc), 0)
+})

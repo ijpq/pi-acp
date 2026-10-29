@@ -36,6 +36,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { CompactionLifecycle } from './compaction.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -54,6 +55,7 @@ type PendingTurn = {
 }
 
 type QueuedTurn = {
+  compact?: boolean
   message: string
   images: unknown[]
   title?: string
@@ -308,6 +310,13 @@ export class PiAcpSession {
   private cancelRequested = false
   private turnFailed = false
   private settling = false
+  private failingTurn: PendingTurn | null = null
+  private failureMessage: string | undefined
+  private readonly compaction: CompactionLifecycle
+
+  executionFailure(): string | undefined {
+    return this.failureMessage
+  }
 
   isRunning(): boolean {
     return this.pendingTurn !== null
@@ -375,6 +384,10 @@ export class PiAcpSession {
     this.fileCommands = opts.fileCommands ?? []
     this.initialTitlePending = opts.autoTitle ?? false
 
+    this.compaction = new CompactionLifecycle(
+      update => this.emit(update),
+      () => this.proc.nativeIdentity?.sessionFile
+    )
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
 
@@ -399,12 +412,20 @@ export class PiAcpSession {
   }
 
   async prompt(message: string, images: unknown[] = [], title?: string): Promise<StopReason> {
+    return this.enqueueTurn(message, images, title)
+  }
+
+  async compact(customInstructions?: string): Promise<StopReason> {
+    return this.enqueueTurn(customInstructions ?? '', [], undefined, true)
+  }
+
+  private async enqueueTurn(message: string, images: unknown[], title?: string, compact = false): Promise<StopReason> {
     if (this.configurationPending > 0) await this.configuration
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, title, resolve, reject }
+      const queued: QueuedTurn = { message: expandedMessage, images, title, resolve, reject, compact }
 
       // If a turn is already running, enqueue.
       if (this.pendingTurn) {
@@ -456,8 +477,10 @@ export class PiAcpSession {
     }
 
     // Abort the currently running turn (if any). If nothing is running, this is a no-op.
-    await this.proc.clearQueue()
-    await this.proc.abort()
+    const turn = this.pendingTurn
+    await this.proc.stopExecution()
+    this.compaction.interrupt('cancelled')
+    if (this.pendingTurn === turn) await this.settleTurn()
   }
 
   wasCancelRequested(): boolean {
@@ -549,12 +572,16 @@ export class PiAcpSession {
   }
 
   private async settleTurn(): Promise<void> {
-    if (!this.pendingTurn || this.settling) return
+    if (!this.pendingTurn || this.settling || this.failingTurn === this.pendingTurn) return
     this.settling = true
     const turn = this.pendingTurn
     // Ensure all updates derived from pi events (plus the final usage update) are
     // delivered before we resolve the ACP `session/prompt` request.
     await this.publishContextUsage()
+    if (this.pendingTurn !== turn) {
+      this.settling = false
+      return
+    }
 
     const reason: StopReason = this.cancelRequested ? 'cancelled' : this.turnFailed ? 'error' : 'end_turn'
     turn.resolve(reason)
@@ -635,6 +662,8 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.turnFailed = false
+    this.failureMessage = undefined
+    this.failingTurn = null
     this.inAgentLoop = false
 
     this.pendingTurn = { title: t.title, resolve: t.resolve, reject: t.reject }
@@ -650,38 +679,43 @@ export class PiAcpSession {
     // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
     // continuations may emit multiple `agent_end` events before `agent_settled`.
     const turn = this.pendingTurn
-    this.proc
-      .prompt(t.message, t.images)
+    const operation = t.compact
+      ? this.proc.compact(t.message || undefined).then(() => 'handled')
+      : this.proc.prompt(t.message, t.images)
+    operation
       .then(disposition => {
-        if (disposition === 'handled') return this.settleTurn()
+        if (this.pendingTurn === turn && disposition === 'handled') return this.settleTurn()
       })
-      .catch(err => {
-        // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
-        // Also ensure we flush any already-enqueued updates first.
-        void this.flushEmits().finally(() => {
-          if (this.pendingTurn !== turn) return
-          // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-          const authErr = maybeAuthRequiredError(err)
-          if (authErr) {
-            this.pendingTurn?.reject(authErr)
-          } else {
-            const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-            this.pendingTurn?.resolve(reason)
-          }
-
-          this.pendingTurn = null
-          for (const queued of this.turnQueue.splice(0)) queued.reject(err)
-          this.inAgentLoop = false
-
-          // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-          // But we still clear the queueDepth metadata.
-          this.emit({
-            sessionUpdate: 'session_info_update',
-            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
-          })
-        })
-        void err
+      .catch(error => {
+        void this.failTurn(turn, error)
       })
+  }
+
+  private async failTurn(turn: PendingTurn, error: unknown): Promise<void> {
+    if (this.pendingTurn !== turn || this.failingTurn === turn) return
+    this.failingTurn = turn
+    let failure = error
+    try {
+      await this.proc.stopExecution()
+    } catch (stopError) {
+      failure = new Error(`${String(error)}; ${String(stopError)}`, { cause: error })
+    }
+    if (this.pendingTurn !== turn) return
+    this.failureMessage = failure instanceof Error ? failure.message : String(failure)
+    this.compaction.interrupt(
+      this.cancelRequested ? 'cancelled' : 'failed',
+      this.cancelRequested ? undefined : this.failureMessage
+    )
+    await this.flushEmits()
+    if (this.pendingTurn !== turn) return
+    if (this.cancelRequested) turn.resolve('cancelled')
+    else turn.reject(maybeAuthRequiredError(failure) ?? failure)
+    this.pendingTurn = null
+    this.failingTurn = null
+    this.settling = false
+    for (const queued of this.turnQueue.splice(0)) queued.reject(failure)
+    this.inAgentLoop = false
+    this.emit({ sessionUpdate: 'session_info_update', _meta: { piAcp: { queueDepth: 0, running: false } } })
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
@@ -690,6 +724,8 @@ export class PiAcpSession {
     switch (type) {
       case 'process_exit': {
         const error = new Error(String(ev.error ?? 'Pi process exited'))
+        this.compaction.interrupt('failed', error.message)
+        if (this.failingTurn === this.pendingTurn) break
         this.pendingTurn?.reject(error)
         this.pendingTurn = null
         for (const queued of this.turnQueue.splice(0)) queued.reject(error)
@@ -980,31 +1016,23 @@ export class PiAcpSession {
         break
       }
 
+      case 'compaction_start':
       case 'auto_compaction_start': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Context nearing limit, running automatic compaction...'
-          } satisfies ContentBlock
-        })
+        this.compaction.start(ev)
         break
       }
-
+      case 'compaction_end':
       case 'auto_compaction_end': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Automatic compaction finished; context was summarized to continue the session.'
-          } satisfies ContentBlock
-        })
+        this.compaction.end(ev)
         break
       }
 
       case 'message_end': {
-        const message = ev.message as { role?: string; stopReason?: string } | undefined
-        if (message?.role === 'assistant' && message.stopReason === 'error') this.turnFailed = true
+        const message = ev.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined
+        if (message?.role === 'assistant') {
+          this.turnFailed = message.stopReason === 'error'
+          this.failureMessage = this.turnFailed ? message.errorMessage : undefined
+        }
         break
       }
 
@@ -1027,6 +1055,7 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
+        if (ev.aborted === true) this.cancelRequested = true
         void this.settleTurn()
         break
       }
