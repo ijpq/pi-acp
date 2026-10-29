@@ -1,4 +1,4 @@
-# CodeG distribution: 0.0.34-codeg.2
+# CodeG distribution: 0.0.34-codeg.3
 
 Based on svkozak/pi-acp (MIT), retaining upstream copyright and license.
 Requires Node >=22.19.0 and Pi >=1.4.0. CodeG ships a private Node 24.16.0,
@@ -65,3 +65,7 @@ field is labelled endpoint-reported, with upstream unverified. A differing
 returned tier is shown verbatim. Provider failures do not retry without the
 requested tier. No speed or relay billing claim is inferred. The option is off
 by default and warns of potentially higher provider/relay charges or quota use.
+
+## Shared canonical skills
+
+CodeG supplies `CODEG_SHARED_SKILL_PATHS_JSON`, a launch-only JSON array of selected-instance Markdown skill directories/files. The adapter resolves paths in the session workspace, deduplicates real paths and passes each original through Pi 1.4.0 native `--skill`. It neither copies skills nor reads another engine's authentication, private memories or extensions. Missing optional roots are ignored; malformed/unreadable configured sources fail explicitly. Pi's own skills and trust settings remain in place; native name collisions retain Pi's documented first source and diagnostics. CodeG delivers shared rules independently of handoff; ledger/skill bodies are read from their canonical paths on demand.

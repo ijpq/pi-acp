@@ -11,6 +11,7 @@ import { getPiAcpDir } from '../acp/paths.js'
 import { type TierChoice } from '../service-tier.js'
 import { readFileSync } from 'node:fs'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { sharedSkillArgs } from './shared-skills.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -191,6 +192,7 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     const env = { ...process.env }
+    args.push(...sharedSkillArgs(env.CODEG_SHARED_SKILL_PATHS_JSON, params.cwd))
     const tierFile = join(
       getPiAcpDir(),
       'service-tiers',
