@@ -118,3 +118,19 @@ test('a terminal provider failure retains its diagnostic until the next task', a
   assert.equal(await task, 'error')
   assert.equal(session.executionFailure(), 'Summary provider policy rejected: 403')
 })
+
+test('an unconfirmed native stop tells the host to terminate the owned connection', async () => {
+  const { proc, session } = fixture()
+  Reflect.set(proc, 'prompt', async () => {
+    throw new Error('fixture admission timed out')
+  })
+  Reflect.set(proc, 'stopExecution', async () => {
+    throw new Error('fixture native tree stop denied')
+  })
+  await assert.rejects(session.prompt('continue'), (error: any) => {
+    assert.equal(error.data?.code, 'PI_STOP_UNCONFIRMED')
+    assert.match(String(error), /fixture admission timed out/)
+    assert.match(String(error), /fixture native tree stop denied/)
+    return true
+  })
+})

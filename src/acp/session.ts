@@ -698,7 +698,9 @@ export class PiAcpSession {
     try {
       await this.proc.stopExecution()
     } catch (stopError) {
-      failure = new Error(`${String(error)}; ${String(stopError)}`, { cause: error })
+      // The host must tear down this owned ACP/native tree before finalizing
+      // the task. A provider failure alone remains a retryable turn failure.
+      failure = RequestError.internalError({ code: 'PI_STOP_UNCONFIRMED' }, `${String(error)}; ${String(stopError)}`)
     }
     if (this.pendingTurn !== turn) return
     this.failureMessage = failure instanceof Error ? failure.message : String(failure)

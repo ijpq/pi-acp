@@ -12,6 +12,7 @@ import { type TierChoice } from '../service-tier.js'
 import { readFileSync } from 'node:fs'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 import { sharedSkillArgs } from './shared-skills.js'
+import { terminateNativeTree } from './terminate.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -128,7 +129,10 @@ export class PiRpcProcess {
   private readonly preludeLines: string[] = []
   private compacting = false
 
-  private constructor(child: ChildProcessWithoutNullStreams) {
+  private constructor(
+    child: ChildProcessWithoutNullStreams,
+    private readonly ownsProcessGroup = false
+  ) {
     this.child = child
 
     const decoder = new StringDecoder('utf8')
@@ -235,6 +239,8 @@ export class PiRpcProcess {
     const child = start(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
+      detached: process.platform !== 'win32',
+      windowsHide: true,
       env
     }) as ChildProcessWithoutNullStreams
 
@@ -278,7 +284,7 @@ export class PiRpcProcess {
       process.stderr.write(chunk)
     })
 
-    const proc = new PiRpcProcess(child)
+    const proc = new PiRpcProcess(child, process.platform !== 'win32')
     proc.tierFile = tierFile
 
     try {
@@ -359,26 +365,13 @@ export class PiRpcProcess {
       // The native abort response is sent only once the session is idle.
       await this.abort()
     } catch (error) {
-      if (this.child.exitCode !== null && this.child.exitCode !== undefined) return
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error('PI_STOP_UNCONFIRMED: native process did not exit', { cause: error })),
-          5_000
-        )
-        this.child.once('exit', () => {
-          clearTimeout(timer)
-          resolve()
+      try {
+        await terminateNativeTree(this.child, this.ownsProcessGroup)
+      } catch (failure) {
+        throw new Error('PI_STOP_UNCONFIRMED: failed to stop the owned native execution', {
+          cause: new AggregateError([error, failure])
         })
-        try {
-          if (!this.child.kill('SIGKILL')) {
-            clearTimeout(timer)
-            reject(new Error('PI_STOP_UNCONFIRMED: native process could not be terminated', { cause: error }))
-          }
-        } catch (failure) {
-          clearTimeout(timer)
-          reject(failure)
-        }
-      })
+      }
     }
   }
 
